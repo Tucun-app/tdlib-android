@@ -41,5 +41,5 @@ one attached to the release. The zip archives themselves carry timestamps; compa
 ## License
 
 TDLib is distributed under the Boost Software License 1.0; the scripts in this repository are released
-under the same license (see `LICENSE`). The built libraries also contain OpenSSL 1.1.1w and SQLite; see
+under the same license (see `LICENSE`). The built libraries also contain OpenSSL 1.1.1w and SQLite/SQLCipher; see
 `NOTICE`.

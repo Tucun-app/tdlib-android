@@ -107,6 +107,17 @@ jobs:
       - name: Build AAR and test APK
         run: gradle -p aar --no-daemon assembleRelease assembleDebugAndroidTest
 
+      - name: Check AAR libraries equal the official ones (byte for byte)
+        run: |
+          set -o pipefail
+          mkdir -p out/aar-check
+          unzip -q aar/build/outputs/aar/tdlib-android-release.aar 'jni/*' -d out/aar-check
+          test "$(ls out/aar-check/jni | wc -l)" -eq 4
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            cmp out/aar-check/jni/$abi/libtdjni.so out/unpacked/tdlib/libs/$abi/libtdjni.so
+            echo "OK   AAR jni/$abi/libtdjni.so == official tdlib/libs/$abi/libtdjni.so"
+          done | tee out/aar-check.txt
+
       - name: Enable KVM for the emulator
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
@@ -137,6 +148,7 @@ jobs:
           cp out/official/tdlib-debug.zip "$dist/tdlib-official-debug-$RELEASE_TAG.zip"
           cp LICENSE "$dist/LICENSE-TDLib.txt"
           curl -sfL "https://raw.githubusercontent.com/openssl/openssl/OpenSSL_1_1_1w/LICENSE" -o "$dist/LICENSE-OpenSSL-1.1.1w.txt"
+          curl -sfL "https://raw.githubusercontent.com/tdlib/td/$TDLIB_COMMIT/sqlite/sqlite/LICENSE" -o "$dist/LICENSE-SQLCipher.txt"
           mkdir -p out/aar-unpacked
           unzip -q "$aar" -d out/aar-unpacked
           {
@@ -153,6 +165,7 @@ jobs:
             echo "## official build"; cat out/official/build-official.txt
             echo "## disk"; cat out/official/disk.txt
             echo "## verify.sh"; cat out/verify.txt
+            echo "## AAR vs official libraries"; cat out/aar-check.txt
             echo "## runtime check (x86_64 emulator, API 34)"; cat out/version-check.txt
             echo "## packaging"; java -version 2>&1; gradle --version | grep -E '^(Gradle|Kotlin|JVM)'
           } > "$dist/build-info.txt"

@@ -16,8 +16,10 @@ OpenSSL 1.1.1w (statically linked into libtdjni.so by the official TDLib build)
   (http://www.openssl.org/).
   This product includes cryptographic software written by Eric Young (eay@cryptsoft.com).
 
-SQLite (bundled in the TDLib source tree)
-  https://www.sqlite.org/ - public domain.
+SQLite with SQLCipher (bundled in the TDLib source tree as sqlite/sqlite, statically linked)
+  SQLite: https://www.sqlite.org/ - public domain.
+  SQLCipher: Copyright (c) 2008, ZETETIC LLC. All rights reserved. BSD-style license; the full text
+  (tdlib/td sqlite/sqlite/LICENSE) is attached to every release as LICENSE-SQLCipher.txt.
 
 The scripts and build files in this repository are released under the Boost Software License,
 Version 1.0.

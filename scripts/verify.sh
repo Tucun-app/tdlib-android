@@ -31,11 +31,25 @@ for abi in arm64-v8a armeabi-v7a x86_64 x86; do
   aligns=$( (readelf -lW "$so" 2>/dev/null || true) | awk '$1 == "LOAD" { print $NF }')
   echo "   LOAD align: $(echo $aligns)"
   if [ -z "$aligns" ]; then echo "FAIL no LOAD segments (not a readable ELF)"; fail=1; continue; fi
+  machine=$( (readelf -hW "$so" 2>/dev/null || true) | awk -F: '/Machine:/ { gsub(/^ +/, "", $2); print $2 }')
+  case "$abi" in
+    arm64-v8a) want_machine="AArch64" ;;
+    armeabi-v7a) want_machine="ARM" ;;
+    x86_64) want_machine="Advanced Micro Devices X86-64" ;;
+    x86) want_machine="Intel 80386" ;;
+  esac
+  if [ "$machine" = "$want_machine" ]; then echo "OK   ELF machine $machine"
+  else echo "FAIL ELF machine '$machine', expected '$want_machine'"; fail=1; fi
   case "$abi" in
     arm64-v8a|x86_64)
-      bad=$(echo "$aligns" | grep -v -x '0x4000' || true)
-      if [ -n "$bad" ]; then echo "FAIL 64-bit LOAD segment not 16 KB aligned: $bad"; fail=1
-      else echo "OK   16 KB aligned (all LOAD = 0x4000)"; fi
+      # 16 KB page size support: every LOAD segment aligned to a power of two >= 0x4000.
+      bad=""
+      for a in $aligns; do
+        v=$((a))
+        if [ "$v" -lt 16384 ] || [ $((v & (v - 1))) -ne 0 ]; then bad="$bad $a"; fi
+      done
+      if [ -n "$bad" ]; then echo "FAIL 64-bit LOAD segment not 16 KB aligned:$bad"; fail=1
+      else echo "OK   16 KB aligned (every LOAD align is a power of two >= 0x4000)"; fi
       ;;
     *) echo "INFO 32-bit ABI: 16 KB alignment not required" ;;
   esac

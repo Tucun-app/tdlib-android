@@ -47,12 +47,23 @@ android_dir="$src/td/example/android"
 cat "$info"
 
 start=$(date +%s)
+# Sample disk usage of / every 30 s to record the peak (the official per-ABI build dirs are removed only
+# at the end of the build).
+( while true; do df -B1 --output=used / | tail -1 >> "$out/df-samples.txt"; sleep 30; done ) &
+sampler=$!
+trap 'kill "$sampler" 2>/dev/null || true' EXIT
 docker build --progress=plain \
   --build-arg "COMMIT_HASH=$TDLIB_COMMIT" \
   --output "type=local,dest=$out" \
-  "$android_dir"
+  "$android_dir" 2>&1 | tee "$out/docker-build.log"
 end=$(date +%s)
+kill "$sampler" 2>/dev/null || true
 echo "docker_build_seconds=$((end - start))" >> "$info"
+peak=$(sort -n "$out/df-samples.txt" | tail -1)
+echo "disk_used_peak_on_root=$((peak / 1024 / 1024)) MiB" >> "$info"
+echo "## base image resolved by the official Dockerfile" >> "$info"
+grep -o -m 1 -E 'docker\.io/library/ubuntu:24\.04@sha256:[0-9a-f]{64}' "$out/docker-build.log" >> "$info" \
+  || echo "UNKNOWN (digest not found in build log)" >> "$info"
 
 ls -l "$out"
 for f in tdlib.zip tdlib-debug.zip; do
