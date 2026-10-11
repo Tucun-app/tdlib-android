@@ -1,0 +1,6 @@
+/out/
+/aar/build/
+/aar/.gradle/
+/aar/src/main/java/
+/aar/src/main/jniLibs/
+/aar/local.properties

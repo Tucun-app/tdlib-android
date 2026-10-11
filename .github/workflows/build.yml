@@ -1,0 +1,215 @@
+name: Build TDLib for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Create the GitHub Release for the version in tdlib.env (fails if the tag already exists)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Official TDLib Android build (unmodified)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Disk usage before cleanup
+        run: df -h | tee df-before.txt
+
+      - name: Free disk space
+        # The official Docker build downloads its own Android SDK/NDK (fetch-sdk.sh, NDK 23.2.8568313),
+        # so the runner's preinstalled Android SDK is not used by this job and can be removed.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /usr/local/lib/android /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"
+          sudo docker image prune --all --force || true
+
+      - name: Disk usage after cleanup
+        run: df -h | tee df-after.txt
+
+      - name: Build with the official example/android Dockerfile
+        run: scripts/build-official.sh out/official
+
+      - name: Disk usage after build
+        if: always()
+        run: df -h | tee df-after-build.txt
+
+      - name: Collect build info
+        run: |
+          {
+            echo "## df -h before cleanup"; cat df-before.txt
+            echo "## df -h after cleanup"; cat df-after.txt
+            echo "## df -h after build"; cat df-after-build.txt
+          } > out/official/disk.txt
+          {
+            echo '### Disk usage (/)'
+            echo '| when | size | used | avail |'
+            echo '|---|---|---|---|'
+            for f in df-before df-after df-after-build; do
+              awk -v w="$f" '$NF == "/" { print "| " w " | " $2 " | " $3 " | " $4 " |" }' "$f.txt"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: official
+          path: out/official/
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+  package:
+    name: Verify and package AAR
+    needs: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: official
+          path: out/official
+
+      - name: Unpack official output
+        run: |
+          mkdir -p out/unpacked
+          unzip -q out/official/tdlib.zip -d out/unpacked
+          find out/unpacked -maxdepth 3 | sort
+
+      - name: Verify (16 KB alignment, embedded commit, Java bindings)
+        run: |
+          scripts/verify.sh out/unpacked/tdlib | tee out/verify.txt
+          { echo '### verify.sh'; echo '```'; cat out/verify.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stage official Java sources and libraries into the AAR module
+        run: |
+          mkdir -p aar/src/main/java aar/src/main/jniLibs
+          cp -R out/unpacked/tdlib/java/. aar/src/main/java/
+          cp -R out/unpacked/tdlib/libs/. aar/src/main/jniLibs/
+          find aar/src/main -type f | sort
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          gradle-version: "9.6.0"
+
+      - name: Build AAR and test APK
+        run: gradle -p aar --no-daemon assembleRelease assembleDebugAndroidTest
+
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Runtime check on x86_64 emulator (version / commit_hash)
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: default
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -no-snapshot
+          script: |
+            adb logcat -c
+            gradle -p aar --no-daemon connectedDebugAndroidTest
+            adb logcat -d -s TdlibVersionCheck:I | tee out/version-check.txt
+
+      - name: Assemble distribution and checksums
+        run: |
+          source tdlib.env
+          dist=out/dist
+          mkdir -p "$dist"
+          aar="$dist/$ARTIFACT_NAME-$RELEASE_TAG.aar"
+          cp aar/build/outputs/aar/tdlib-android-release.aar "$aar"
+          cp out/official/tdlib.zip "$dist/tdlib-official-$RELEASE_TAG.zip"
+          cp out/official/tdlib-debug.zip "$dist/tdlib-official-debug-$RELEASE_TAG.zip"
+          cp LICENSE "$dist/LICENSE-TDLib.txt"
+          curl -sfL "https://raw.githubusercontent.com/openssl/openssl/OpenSSL_1_1_1w/LICENSE" -o "$dist/LICENSE-OpenSSL-1.1.1w.txt"
+          mkdir -p out/aar-unpacked
+          unzip -q "$aar" -d out/aar-unpacked
+          {
+            echo "# Release assets"
+            (cd "$dist" && sha256sum *.aar *.zip)
+            echo "# Files inside the official tdlib.zip"
+            (cd out/unpacked && find tdlib/libs tdlib/java -type f | LC_ALL=C sort | xargs sha256sum)
+            echo "# Files inside the AAR"
+            (cd out/aar-unpacked && find . -type f | LC_ALL=C sort | xargs sha256sum)
+          } > "$dist/SHA256SUMS.txt"
+          {
+            echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
+            echo "repo_commit=$GITHUB_SHA"
+            echo "## official build"; cat out/official/build-official.txt
+            echo "## disk"; cat out/official/disk.txt
+            echo "## verify.sh"; cat out/verify.txt
+            echo "## runtime check (x86_64 emulator, API 34)"; cat out/version-check.txt
+            echo "## packaging"; java -version 2>&1; gradle --version | grep -E '^(Gradle|Kotlin|JVM)'
+          } > "$dist/build-info.txt"
+          ls -l "$dist"
+          { echo '### SHA256SUMS.txt'; echo '```'; cat "$dist/SHA256SUMS.txt"; echo '```';
+            echo '### Runtime check'; echo '```'; cat out/version-check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          grep -q "commit_hash=$TDLIB_COMMIT" out/version-check.txt
+          grep -q "version=$TDLIB_VERSION " out/version-check.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: out/dist/
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish }}
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: out/dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source tdlib.env
+          cd out/dist
+          assets=()
+          for f in *; do
+            size=$(stat -c %s "$f")
+            if [ "$size" -ge 2000000000 ]; then
+              echo "skip $f: $size bytes is over the 2 GiB release asset limit" | tee -a skipped.txt
+            else
+              assets+=("$f")
+            fi
+          done
+          {
+            echo "Official TDLib $TDLIB_VERSION (tdlib/td@$TDLIB_COMMIT), built without modification by the official"
+            echo "\`example/android\` Docker build and packaged as an Android library (AAR)."
+            echo
+            echo "Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID from $GITHUB_SHA."
+            echo
+            echo '```'; cat SHA256SUMS.txt; echo '```'
+            if [ -f skipped.txt ]; then echo; cat skipped.txt; fi
+          } > ../release-notes.md
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "TDLib $TDLIB_VERSION ($RELEASE_TAG)" --notes-file ../release-notes.md
