@@ -52,10 +52,25 @@ start=$(date +%s)
 ( while true; do df -B1 --output=used / | tail -1 >> "$out/df-samples.txt"; sleep 30; done ) &
 sampler=$!
 trap 'kill "$sampler" 2>/dev/null || true' EXIT
-docker build --progress=plain \
-  --build-arg "COMMIT_HASH=$TDLIB_COMMIT" \
-  --output "type=local,dest=$out" \
-  "$android_dir" 2>&1 | tee "$out/docker-build.log"
+# The official Dockerfile fetches https://api.github.com/repos/tdlib/td/git/refs/heads/master without
+# authentication (only to invalidate its cache); on shared runner IPs that can hit the API rate limit
+# (HTTP 403) within the first seconds. Retry only that failure; any other failure stops immediately.
+for attempt in 1 2 3 4; do
+  if docker build --progress=plain \
+      --build-arg "COMMIT_HASH=$TDLIB_COMMIT" \
+      --output "type=local,dest=$out" \
+      "$android_dir" 2>&1 | tee "$out/docker-build.log"; then
+    break
+  fi
+  if [ "$attempt" -lt 4 ] && grep -q 'api.github.com/repos/tdlib/td/git/refs/heads/master' "$out/docker-build.log" \
+      && grep -q 'invalid response status 403' "$out/docker-build.log"; then
+    echo "official Dockerfile: GitHub API rate limit on the cache-busting ADD (attempt $attempt); retrying in 10 minutes"
+    echo "docker_build_retry_after_api_403=attempt $attempt" >> "$info"
+    sleep 600
+    continue
+  fi
+  exit 1
+done
 end=$(date +%s)
 kill "$sampler" 2>/dev/null || true
 echo "docker_build_seconds=$((end - start))" >> "$info"
