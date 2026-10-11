@@ -24,7 +24,7 @@ Only build instructions. No TDLib source code is copied here and no source patch
 - `aar/` – a minimal Android library module that wraps the official output (`Client.java`, `TdApi.java`,
   `libs/<abi>/libtdjni.so`) into an AAR without changing the native libraries, plus an instrumentation
   test that loads the library on an emulator and checks the `version` and `commit_hash` options.
-- `.github/workflows/build.yml` – runs all of the above on a standard GitHub-hosted `ubuntu-latest` runner
+- `.github/workflows/build.yml` – runs all of the above on a standard GitHub-hosted `ubuntu-24.04` runner (pinned: `ubuntu-latest` moves to Ubuntu 26 from 2026-10-19)
   and, when asked, publishes a GitHub Release.
 
 ## Releases
