@@ -30,14 +30,14 @@ RUN git clone https://github.com/tdlib/td.git . && git checkout "$TDLIB_COMMIT" 
 RUN mkdir build && cd build \
     && if [ -n "$SANITIZE" ]; then \
          cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=OFF \
-           -DCMAKE_C_FLAGS_RELEASE="-O1 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O1 -DNDEBUG" \
+           -DCMAKE_C_FLAGS_RELEASE="-O0 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O0 -DNDEBUG" \
            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" .. ; \
        else \
          cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=OFF .. ; \
        fi \
-    && ASAN_OPTIONS=detect_leaks=0 cmake --build . --target tdjson -j3
+    && ASAN_OPTIONS=detect_leaks=0 cmake --build . --target tdjson -j"$(if [ -n "$SANITIZE" ]; then echo 4; else echo 3; fi)"
 COPY linux/check_version.py /tmp/check_version.py
 RUN mkdir /out && cp -L build/libtdjson.so /out/libtdjson.so \
     && if [ -z "$SANITIZE" ]; then strip --strip-unneeded /out/libtdjson.so; fi \
