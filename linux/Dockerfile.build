@@ -1,16 +1,49 @@
-# Official TDLib (unmodified) -> libtdjson.so for linux x86_64, built on Debian 12 (glibc 2.36).
-# Purpose: a TDLib client for server-side measurements that matches the app's TDLib version.
+# Official TDLib + the source patches listed in tdlib.env -> libtdjson.so for linux x86_64, built on Debian 12
+# (glibc 2.36). Purpose: a TDLib client for server-side measurements that matches the app's TDLib build.
+# SANITIZE=1 builds an AddressSanitizer + UndefinedBehaviorSanitizer variant (not stripped; load it with
+# LD_PRELOAD=libasan.so, see linux/check_version.py usage below).
 FROM debian:bookworm
 ARG TDLIB_COMMIT
+ARG TDLIB_PATCH_NAME
+ARG TDLIB_PATCH_EMAIL
+ARG TDLIB_PATCH_DATE
+ARG TDLIB_PATCH_MESSAGE
+ARG TDLIB_PATCHED_COMMIT
+ARG SANITIZE=
 RUN apt-get update && apt-get install -y --no-install-recommends \
       make git zlib1g-dev libssl-dev gperf cmake g++ ca-certificates python3 \
     && apt-get clean
 WORKDIR /src
-RUN git clone https://github.com/tdlib/td.git . && git checkout "$TDLIB_COMMIT" && git log -1 --format='commit=%H' | tee /src/COMMIT.txt
+COPY patches /patches
+# The patches are applied and committed BEFORE COMMIT.txt is written, so COMMIT.txt and TDLib's commit_hash both
+# name the patched commit (fixed identity/date/message from tdlib.env -> reproducible hash).
+RUN git clone https://github.com/tdlib/td.git . && git checkout "$TDLIB_COMMIT" \
+    && if [ -n "$TDLIB_PATCHED_COMMIT" ]; then \
+         git apply --index /patches/*.patch \
+         && GIT_AUTHOR_NAME="$TDLIB_PATCH_NAME" GIT_AUTHOR_EMAIL="$TDLIB_PATCH_EMAIL" GIT_AUTHOR_DATE="$TDLIB_PATCH_DATE" \
+            GIT_COMMITTER_NAME="$TDLIB_PATCH_NAME" GIT_COMMITTER_EMAIL="$TDLIB_PATCH_EMAIL" GIT_COMMITTER_DATE="$TDLIB_PATCH_DATE" \
+            git -c commit.gpgsign=false commit -q -m "$TDLIB_PATCH_MESSAGE" \
+         && test "$(git rev-parse HEAD)" = "$TDLIB_PATCHED_COMMIT"; \
+       fi \
+    && git log -1 --format='commit=%H' | tee /src/COMMIT.txt
 RUN mkdir build && cd build \
-    && cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=OFF .. \
+    && if [ -n "$SANITIZE" ]; then \
+         cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTD_ENABLE_LTO=OFF \
+           -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+           -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+           -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" .. ; \
+       else \
+         cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=OFF .. ; \
+       fi \
     && cmake --build . --target tdjson -j3
 COPY linux/check_version.py /tmp/check_version.py
-RUN mkdir /out && cp -L build/libtdjson.so /out/libtdjson.so && strip --strip-unneeded /out/libtdjson.so \
+RUN mkdir /out && cp -L build/libtdjson.so /out/libtdjson.so \
+    && if [ -z "$SANITIZE" ]; then strip --strip-unneeded /out/libtdjson.so; fi \
     && ldd /out/libtdjson.so | tee /out/ldd.txt \
-    && python3 /tmp/check_version.py /out/libtdjson.so | tee /out/version.txt
+    && if [ -n "$SANITIZE" ]; then \
+         LD_PRELOAD="$(gcc -print-file-name=libasan.so) $(gcc -print-file-name=libubsan.so)" ASAN_OPTIONS=detect_leaks=0 \
+           python3 /tmp/check_version.py /out/libtdjson.so | tee /out/version.txt; \
+       else \
+         python3 /tmp/check_version.py /out/libtdjson.so | tee /out/version.txt; \
+       fi \
+    && cp /src/COMMIT.txt /out/COMMIT.txt

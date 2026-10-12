@@ -1,7 +1,8 @@
 name: Build TDLib tdjson for Linux x86_64
 
-# Measurement tooling only (not shipped in the app). Builds the same TDLib commit as tdlib.env,
-# unmodified, as libtdjson.so inside a Debian 12 container. Standard free runner, public repo.
+# Measurement tooling only (not shipped in the app). Builds the same TDLib commit and source patches as tdlib.env
+# as libtdjson.so inside a Debian 12 container: a release build and an ASan+UBSan build. Standard free runner,
+# public repo.
 on:
   push:
     branches: [linux-tdjson]
@@ -13,26 +14,41 @@ permissions:
 jobs:
   linux-tdjson:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [release, asan]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Build libtdjson.so in Debian 12
+      - name: Build libtdjson.so in Debian 12 (${{ matrix.variant }})
         run: |
+          set -o pipefail
           source tdlib.env
-          docker build -f linux/Dockerfile.build --build-arg TDLIB_COMMIT="$TDLIB_COMMIT" -t tdjson-build .
+          sanitize=""
+          if [ "${{ matrix.variant }}" = asan ]; then sanitize=1; fi
+          docker build -f linux/Dockerfile.build \
+            --build-arg TDLIB_COMMIT="$TDLIB_COMMIT" \
+            --build-arg TDLIB_PATCH_NAME="$TDLIB_PATCH_NAME" --build-arg TDLIB_PATCH_EMAIL="$TDLIB_PATCH_EMAIL" \
+            --build-arg TDLIB_PATCH_DATE="$TDLIB_PATCH_DATE" --build-arg TDLIB_PATCH_MESSAGE="$TDLIB_PATCH_MESSAGE" \
+            --build-arg TDLIB_PATCHED_COMMIT="$TDLIB_PATCHED_COMMIT" --build-arg SANITIZE="$sanitize" \
+            -t tdjson-build .
           mkdir -p out
           cid=$(docker create tdjson-build)
           docker cp "$cid":/out/. out/
           docker rm "$cid"
-          (cd out && sha256sum libtdjson.so > SHA256SUMS.txt && cat SHA256SUMS.txt version.txt ldd.txt)
-          { echo '```'; cat out/SHA256SUMS.txt out/version.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          grep -q "commit_hash.*$TDLIB_COMMIT" out/version.txt
+          sha256sum $TDLIB_PATCHES | tee out/patches.sha256
+          (cd out && sha256sum libtdjson.so > SHA256SUMS.txt && cat SHA256SUMS.txt version.txt COMMIT.txt ldd.txt)
+          { echo '```'; cat out/SHA256SUMS.txt out/patches.sha256 out/version.txt out/COMMIT.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          want="${TDLIB_PATCHED_COMMIT:-$TDLIB_COMMIT}"
+          grep -q "commit_hash.*$want" out/version.txt
+          grep -q "commit=$want" out/COMMIT.txt
           grep -q "version.*$TDLIB_VERSION" out/version.txt
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-tdjson
+          name: linux-tdjson-${{ matrix.variant }}
           path: out/
           compression-level: 0
           retention-days: 30
