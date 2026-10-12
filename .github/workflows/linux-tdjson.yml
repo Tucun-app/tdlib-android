@@ -14,7 +14,8 @@ permissions:
 jobs:
   linux-tdjson:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # ASan (RelWithDebInfo, -j3) did not finish within 120 min on 10-13; -O1 without -g and a longer limit.
+    timeout-minutes: 330
     strategy:
       fail-fast: false
       matrix:

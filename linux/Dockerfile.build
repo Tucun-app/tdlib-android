@@ -29,7 +29,8 @@ RUN git clone https://github.com/tdlib/td.git . && git checkout "$TDLIB_COMMIT" 
     && git log -1 --format='commit=%H' | tee /src/COMMIT.txt
 RUN mkdir build && cd build \
     && if [ -n "$SANITIZE" ]; then \
-         cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTD_ENABLE_LTO=OFF \
+         cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=OFF \
+           -DCMAKE_C_FLAGS_RELEASE="-O1 -DNDEBUG" -DCMAKE_CXX_FLAGS_RELEASE="-O1 -DNDEBUG" \
            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" .. ; \
