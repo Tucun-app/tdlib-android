@@ -1,7 +1,8 @@
 # Official TDLib + the source patches listed in tdlib.env -> libtdjson.so for linux x86_64, built on Debian 12
 # (glibc 2.36). Purpose: a TDLib client for server-side measurements that matches the app's TDLib build.
 # SANITIZE=1 builds an AddressSanitizer + UndefinedBehaviorSanitizer variant (not stripped; load it with
-# LD_PRELOAD=libasan.so, see linux/check_version.py usage below).
+# LD_PRELOAD=libasan.so, see the version check below). The build-time code generators (tl-parser) are built with the
+# same flags; their leaks are not part of the library, so LeakSanitizer is off while building.
 FROM debian:bookworm
 ARG TDLIB_COMMIT
 ARG TDLIB_PATCH_NAME
@@ -35,7 +36,7 @@ RUN mkdir build && cd build \
        else \
          cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=OFF .. ; \
        fi \
-    && cmake --build . --target tdjson -j3
+    && ASAN_OPTIONS=detect_leaks=0 cmake --build . --target tdjson -j3
 COPY linux/check_version.py /tmp/check_version.py
 RUN mkdir /out && cp -L build/libtdjson.so /out/libtdjson.so \
     && if [ -z "$SANITIZE" ]; then strip --strip-unneeded /out/libtdjson.so; fi \
