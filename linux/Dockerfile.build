@@ -1,0 +1,16 @@
+# Official TDLib (unmodified) -> libtdjson.so for linux x86_64, built on Debian 12 (glibc 2.36).
+# Purpose: a TDLib client for server-side measurements that matches the app's TDLib version.
+FROM debian:bookworm
+ARG TDLIB_COMMIT
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      make git zlib1g-dev libssl-dev gperf cmake g++ ca-certificates python3 \
+    && apt-get clean
+WORKDIR /src
+RUN git clone https://github.com/tdlib/td.git . && git checkout "$TDLIB_COMMIT" && git log -1 --format='commit=%H' | tee /src/COMMIT.txt
+RUN mkdir build && cd build \
+    && cmake -DCMAKE_BUILD_TYPE=Release -DTD_ENABLE_LTO=OFF .. \
+    && cmake --build . --target tdjson -j3
+COPY linux/check_version.py /tmp/check_version.py
+RUN mkdir /out && cp -L build/libtdjson.so /out/libtdjson.so && strip --strip-unneeded /out/libtdjson.so \
+    && ldd /out/libtdjson.so | tee /out/ldd.txt \
+    && python3 /tmp/check_version.py /out/libtdjson.so | tee /out/version.txt
