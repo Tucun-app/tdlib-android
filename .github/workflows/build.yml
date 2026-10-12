@@ -12,8 +12,61 @@ permissions:
   contents: read
 
 jobs:
+  patch-check:
+    name: Source patch guard and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Fetch stock TDLib and apply the patches
+        run: |
+          set -o pipefail
+          source tdlib.env
+          git init -q stock
+          git -C stock config core.autocrlf false
+          git -C stock remote add origin https://github.com/tdlib/td.git
+          git -C stock fetch -q --depth 1 origin "$TDLIB_COMMIT"
+          git -C stock checkout -q FETCH_HEAD
+          test "$(git -C stock rev-parse HEAD)" = "$TDLIB_COMMIT"
+          git -C stock worktree add -q --detach ../patched "$TDLIB_COMMIT"
+          for p in $TDLIB_PATCHES; do git -C patched apply --index "$PWD/$p"; done
+          GIT_AUTHOR_NAME="$TDLIB_PATCH_NAME" GIT_AUTHOR_EMAIL="$TDLIB_PATCH_EMAIL" GIT_AUTHOR_DATE="$TDLIB_PATCH_DATE" \
+            GIT_COMMITTER_NAME="$TDLIB_PATCH_NAME" GIT_COMMITTER_EMAIL="$TDLIB_PATCH_EMAIL" GIT_COMMITTER_DATE="$TDLIB_PATCH_DATE" \
+            git -C patched -c commit.gpgsign=false commit -q -m "$TDLIB_PATCH_MESSAGE"
+          echo "patched_commit=$(git -C patched rev-parse HEAD) expected=$TDLIB_PATCHED_COMMIT" | tee patch-check.txt
+          test "$(git -C patched rev-parse HEAD)" = "$TDLIB_PATCHED_COMMIT"
+          sha256sum $TDLIB_PATCHES | tee -a patch-check.txt
+
+      - name: Content guard (scripts/check-patch-scope.sh) and its counter-examples
+        run: |
+          set -o pipefail
+          source tdlib.env
+          for p in $TDLIB_PATCHES; do
+            scripts/check-patch-scope.sh stock patched "$p" | tee -a patch-check.txt
+            scripts/check-patch-scope.sh --self-test stock patched "$p" | tee -a patch-check.txt
+          done
+
+      - name: Unit tests of FileHashWindow.h (TDLib language flags + ASan/UBSan)
+        run: |
+          set -o pipefail
+          g++ --version | head -1 | tee -a patch-check.txt
+          g++ -std=c++17 -fno-exceptions -fno-rtti -Wall -Wextra -Werror -O1 -g \
+            -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer \
+            -I patched tests/hash_window_test.cpp -o hash_window_test
+          ./hash_window_test | tee -a patch-check.txt
+          { echo '### Patch guard and unit tests'; echo '```'; cat patch-check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: patch-check
+          path: patch-check.txt
+          retention-days: 30
+          if-no-files-found: error
+
   native:
-    name: Official TDLib Android build (unmodified)
+    name: Official TDLib Android build + source patches (tdlib.env)
+    needs: patch-check
     runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
@@ -33,7 +86,7 @@ jobs:
       - name: Disk usage after cleanup
         run: df -h | tee df-after.txt
 
-      - name: Build with the official example/android Dockerfile
+      - name: Build with the official example/android Dockerfile (+ patches from tdlib.env)
         run: scripts/build-official.sh out/official
 
       - name: Disk usage after build
@@ -85,6 +138,7 @@ jobs:
 
       - name: Verify (16 KB alignment, embedded commit, Java bindings)
         run: |
+          set -o pipefail
           scripts/verify.sh out/unpacked/tdlib | tee out/verify.txt
           { echo '### verify.sh'; echo '```'; cat out/verify.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
@@ -107,7 +161,7 @@ jobs:
       - name: Build AAR and test APK
         run: gradle -p aar --no-daemon assembleRelease assembleDebugAndroidTest
 
-      - name: Check AAR libraries equal the official ones (byte for byte)
+      - name: Check AAR libraries equal the built ones (byte for byte)
         run: |
           set -o pipefail
           mkdir -p out/aar-check
@@ -115,7 +169,7 @@ jobs:
           test "$(ls out/aar-check/jni | wc -l)" -eq 4
           for abi in arm64-v8a armeabi-v7a x86_64 x86; do
             cmp out/aar-check/jni/$abi/libtdjni.so out/unpacked/tdlib/libs/$abi/libtdjni.so
-            echo "OK   AAR jni/$abi/libtdjni.so == official tdlib/libs/$abi/libtdjni.so"
+            echo "OK   AAR jni/$abi/libtdjni.so == built tdlib/libs/$abi/libtdjni.so"
           done | tee out/aar-check.txt
 
       - name: Enable KVM for the emulator
@@ -144,8 +198,8 @@ jobs:
           mkdir -p "$dist"
           aar="$dist/$ARTIFACT_NAME-$RELEASE_TAG.aar"
           cp aar/build/outputs/aar/tdlib-android-release.aar "$aar"
-          cp out/official/tdlib.zip "$dist/tdlib-official-$RELEASE_TAG.zip"
-          cp out/official/tdlib-debug.zip "$dist/tdlib-official-debug-$RELEASE_TAG.zip"
+          cp out/official/tdlib.zip "$dist/tdlib-native-$RELEASE_TAG.zip"
+          cp out/official/tdlib-debug.zip "$dist/tdlib-native-debug-$RELEASE_TAG.zip"
           cp LICENSE "$dist/LICENSE-TDLib.txt"
           curl -sfL "https://raw.githubusercontent.com/openssl/openssl/OpenSSL_1_1_1w/LICENSE" -o "$dist/LICENSE-OpenSSL-1.1.1w.txt"
           curl -sfL "https://raw.githubusercontent.com/tdlib/td/$TDLIB_COMMIT/sqlite/sqlite/LICENSE" -o "$dist/LICENSE-SQLCipher.txt"
@@ -154,7 +208,7 @@ jobs:
           {
             echo "# Release assets"
             (cd "$dist" && sha256sum *.aar *.zip)
-            echo "# Files inside the official tdlib.zip"
+            echo "# Files inside tdlib.zip (official build + patches)"
             (cd out/unpacked && find tdlib/libs tdlib/java -type f | LC_ALL=C sort | xargs sha256sum)
             echo "# Files inside the AAR"
             (cd out/aar-unpacked && find . -type f | LC_ALL=C sort | xargs sha256sum)
@@ -162,6 +216,8 @@ jobs:
           {
             echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID (attempt $GITHUB_RUN_ATTEMPT)"
             echo "repo_commit=$GITHUB_SHA"
+            echo "## source patches (tdlib.env TDLIB_PATCHES)"; sha256sum $TDLIB_PATCHES
+            echo "tdlib_patched_commit=$TDLIB_PATCHED_COMMIT"
             echo "## official build"; cat out/official/build-official.txt
             echo "## disk"; cat out/official/disk.txt
             echo "## verify.sh"; cat out/verify.txt
@@ -172,7 +228,7 @@ jobs:
           ls -l "$dist"
           { echo '### SHA256SUMS.txt'; echo '```'; cat "$dist/SHA256SUMS.txt"; echo '```';
             echo '### Runtime check'; echo '```'; cat out/version-check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          grep -q "commit_hash=$TDLIB_COMMIT" out/version-check.txt
+          grep -q "commit_hash=${TDLIB_PATCHED_COMMIT:-$TDLIB_COMMIT}" out/version-check.txt
           grep -q "version=$TDLIB_VERSION " out/version-check.txt
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -215,8 +271,9 @@ jobs:
             fi
           done
           {
-            echo "Official TDLib $TDLIB_VERSION (tdlib/td@$TDLIB_COMMIT), built without modification by the official"
-            echo "\`example/android\` Docker build and packaged as an Android library (AAR)."
+            echo "TDLib $TDLIB_VERSION: official tdlib/td@$TDLIB_COMMIT plus the source patches in \`patches/\`"
+            echo "($TDLIB_PATCHES, Boost Software License 1.0; resulting commit_hash $TDLIB_PATCHED_COMMIT), built by the"
+            echo "official \`example/android\` Docker build and packaged as an Android library (AAR)."
             echo
             echo "Built by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID from $GITHUB_SHA."
             echo

@@ -1,4 +1,4 @@
-// Packages the official, unmodified TDLib Android output into an AAR.
+// Packages the TDLib Android output of the official build (plus the source patches listed in tdlib.env) into an AAR.
 // src/main/java (Client.java, TdApi.java) and src/main/jniLibs (<abi>/libtdjni.so) are copied from the
 // official tdlib.zip by the workflow before this build runs; they are not committed to this repository.
 plugins {
@@ -17,7 +17,9 @@ android {
         minSdk = 21
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         testInstrumentationRunnerArguments["expectedVersion"] = tdlibEnv.getValue("TDLIB_VERSION")
-        testInstrumentationRunnerArguments["expectedCommit"] = tdlibEnv.getValue("TDLIB_COMMIT")
+        // The commit TDLib reports as "commit_hash": the patched commit when tdlib.env applies source patches.
+        testInstrumentationRunnerArguments["expectedCommit"] =
+            tdlibEnv["TDLIB_PATCHED_COMMIT"]?.takeIf { it.isNotEmpty() } ?: tdlibEnv.getValue("TDLIB_COMMIT")
     }
     compileOptions {
         // Same bytecode level as the com.github.tdlibx:td AAR it replaces (class file major 52).

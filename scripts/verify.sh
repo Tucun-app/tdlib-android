@@ -3,7 +3,8 @@
 #   1. every expected ABI has libtdjni.so;
 #   2. every LOAD segment of each 64-bit .so is aligned to 16 KB (0x4000) - required by Google Play;
 #      32-bit alignment is printed for the record only;
-#   3. each .so embeds the pinned commit hash (the value TDLib reports as option "commit_hash");
+#   3. each .so embeds the pinned commit hash (the value TDLib reports as option "commit_hash"): TDLIB_PATCHED_COMMIT
+#      when tdlib.env sets it (source patches applied), otherwise TDLIB_COMMIT;
 #   4. Java bindings (Client.java, TdApi.java) are present.
 # Prints a report and exits non-zero on any failure.
 #
@@ -16,6 +17,7 @@ source "$repo_root/tdlib.env"
 
 dir=${1:?usage: verify.sh <unpacked-tdlib-dir>}
 fail=0
+want_commit=${TDLIB_PATCHED_COMMIT:-$TDLIB_COMMIT}
 
 for f in java/org/drinkless/tdlib/Client.java java/org/drinkless/tdlib/TdApi.java; do
   if [ -s "$dir/$f" ]; then echo "OK   present $f"; else echo "FAIL missing $f"; fail=1; fi
@@ -53,10 +55,10 @@ for abi in arm64-v8a armeabi-v7a x86_64 x86; do
       ;;
     *) echo "INFO 32-bit ABI: 16 KB alignment not required" ;;
   esac
-  if strings -a "$so" | grep -q -x -F "$TDLIB_COMMIT"; then
-    echo "OK   embeds commit_hash $TDLIB_COMMIT"
+  if strings -a "$so" | grep -q -x -F "$want_commit"; then
+    echo "OK   embeds commit_hash $want_commit"
   else
-    echo "FAIL commit hash $TDLIB_COMMIT not found in .so"; fail=1
+    echo "FAIL commit hash $want_commit not found in .so"; fail=1
   fi
   if strings -a "$so" | grep -q -x -F "$TDLIB_VERSION"; then
     echo "OK   embeds version string $TDLIB_VERSION"

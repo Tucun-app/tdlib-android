@@ -1,0 +1,384 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tdlib-android <tdlib-android@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Parallel upload.getFileHashes in only-check mode (option
+ x_file_hashes_inflight)
+
+Modification of TDLib (https://github.com/tdlib/td) by Tucun-app/tdlib-android,
+released under the Boost Software License, Version 1.0 (same as TDLib; see
+LICENSE_1_0.txt). Files changed: td/telegram/files/FileDownloader.h,
+td/telegram/files/FileDownloader.cpp; new: td/telegram/files/FileHashWindow.h.
+
+When a file is downloaded in only-check mode (TDLib found a local file with the
+same name and size and verifies it against the server hashes instead of
+downloading it), up to x_file_hashes_inflight upload.getFileHashes queries of
+the file may be in flight at once (default 1 = unmodified behaviour; clamped to
+1..32). A process-wide counter limits the extra queries. The comparison of local
+bytes with the server hashes in FileDownloader::check_loop is unchanged and is
+still the only code that advances the checked prefix.
+---
+ td/telegram/files/FileDownloader.cpp |  84 ++++++++++--
+ td/telegram/files/FileDownloader.h   |   7 +
+ td/telegram/files/FileHashWindow.h   | 197 +++++++++++++++++++++++++++
+ 3 files changed, 277 insertions(+), 11 deletions(-)
+ create mode 100644 td/telegram/files/FileHashWindow.h
+
+diff --git a/td/telegram/files/FileDownloader.cpp b/td/telegram/files/FileDownloader.cpp
+index 5ccf9e9..99a528d 100644
+--- a/td/telegram/files/FileDownloader.cpp
++++ b/td/telegram/files/FileDownloader.cpp
+@@ -371,25 +371,61 @@ Status FileDownloader::check_loop(int64 checked_prefix_size, int64 ready_prefix_
+       is_changed = true;
+       continue;
+     }
+-    if (!has_hash_query_) {
+-      has_hash_query_ = true;
+-      auto query = telegram_api::upload_getFileHashes(remote_.as_input_file_location(), checked_prefix_size);
+-      auto net_query_type = is_small_ ? NetQuery::Type::DownloadSmall : NetQuery::Type::Download;
+-      auto net_query = G()->net_query_creator().create(query, {}, remote_.get_dc_id(), net_query_type);
+-      queries.push_back(std::move(net_query));
++    // x_file_hashes_inflight: begin R1
++    if (hash_inflight_limit_ <= 1) {
++      if (!has_hash_query_) {
++        has_hash_query_ = true;
++        auto query = telegram_api::upload_getFileHashes(remote_.as_input_file_location(), checked_prefix_size);
++        auto net_query_type = is_small_ ? NetQuery::Type::DownloadSmall : NetQuery::Type::Download;
++        auto net_query = G()->net_query_creator().create(query, {}, remote_.get_dc_id(), net_query_type);
++        queries.push_back(std::move(net_query));
++        break;
++      }
++      // Should fail?
++      break;
++    } else {
++      // Only asks for hashes; the comparison above stays the only code that advances the checked prefix.
++      if (!hash_no_new_queries_) {
++        int64 covered_end = 0;
++        if (!hash_info_.empty()) {
++          covered_end = hash_info_.rbegin()->offset + narrow_cast<int64>(hash_info_.rbegin()->size);
++        }
++        auto offsets = file_hash_window::pick_offsets(checked_prefix_size, size_, covered_end, hash_queries_.offsets(),
++                                                      hash_inflight_limit_, file_hash_window::global_counter());
++        for (auto offset : offsets) {
++          auto query = telegram_api::upload_getFileHashes(remote_.as_input_file_location(), offset);
++          auto net_query_type = is_small_ ? NetQuery::Type::DownloadSmall : NetQuery::Type::Download;
++          auto net_query = G()->net_query_creator().create(query, {}, remote_.get_dc_id(), net_query_type);
++          auto token = UniqueId::next(UniqueId::Type::Default, COMMON_QUERY_KEY);
++          hash_queries_.add(token, offset, net_query->cancel_slot_.get_signal_new());
++          hash_new_tokens_.push_back(token);
++          queries.push_back(std::move(net_query));
++          VLOG(file_loader) << "File hash window: ask " << offset << " prefix " << checked_prefix_size << " file \""
++                            << name_ << "\" in flight " << hash_queries_.size() << " process "
++                            << file_hash_window::global_counter().value();
++        }
++      }
+       break;
+     }
+-    // Should fail?
+-    break;
++    // x_file_hashes_inflight: end R1
+   }
+ 
+   if (is_changed) {
+     on_progress();
+   }
+-  for (auto &query : queries) {
+-    G()->net_query_dispatcher().dispatch_with_callback(
+-        std::move(query), actor_shared(this, UniqueId::next(UniqueId::Type::Default, COMMON_QUERY_KEY)));
++  // x_file_hashes_inflight: begin R2
++  if (hash_inflight_limit_ <= 1) {
++    for (auto &query : queries) {
++      G()->net_query_dispatcher().dispatch_with_callback(
++          std::move(query), actor_shared(this, UniqueId::next(UniqueId::Type::Default, COMMON_QUERY_KEY)));
++    }
++  } else {
++    for (size_t i = 0; i < queries.size() && i < hash_new_tokens_.size(); i++) {
++      G()->net_query_dispatcher().dispatch_with_callback(std::move(queries[i]), actor_shared(this, hash_new_tokens_[i]));
++    }
++    hash_new_tokens_.clear();
+   }
++  // x_file_hashes_inflight: end R2
+   if (need_check_) {
+     parts_manager_.set_need_check();
+     parts_manager_.set_checked_prefix_size(checked_prefix_size);
+@@ -442,6 +478,9 @@ void FileDownloader::update_resources(const ResourceState &other) {
+ }
+ 
+ void FileDownloader::hangup() {
++  if (hash_inflight_limit_ > 1) {
++    hash_no_new_queries_ = true;
++  }
+   if (delay_dispatcher_.empty()) {
+     stop();
+   } else {
+@@ -524,6 +563,13 @@ void FileDownloader::start_up() {
+     }
+   }
+   try_release_fd();
++  if (only_check_) {
++    hash_inflight_limit_ = file_hash_window::clamp_limit(G()->get_option_integer("x_file_hashes_inflight", 1));
++    if (hash_inflight_limit_ > 1) {
++      VLOG(file_loader) << "File hash window: limit " << hash_inflight_limit_ << " file \"" << name_ << "\" process "
++                        << file_hash_window::global_counter().value();
++    }
++  }
+ 
+   auto ready_parts = bitmask.as_vector();
+   auto status = parts_manager_.init(size_, size_, true, part_size, ready_parts, false, false);
+@@ -631,6 +677,12 @@ Status FileDownloader::do_loop() {
+ }
+ 
+ void FileDownloader::tear_down() {
++  if (hash_inflight_limit_ > 1) {
++    auto cancelled = hash_queries_.size();
++    hash_queries_.drain(file_hash_window::global_counter(), [](ActorShared<> &cancel) { cancel.reset(); });
++    VLOG(file_loader) << "File hash window: tear down file \"" << name_ << "\" cancelled " << cancelled << " process "
++                      << file_hash_window::global_counter().value();
++  }
+   for (auto &it : part_map_) {
+     it.second.second.reset();  // cancel_query(it.second.second);
+   }
+@@ -655,6 +707,16 @@ void FileDownloader::update_estimated_limit() {
+ }
+ 
+ void FileDownloader::on_result(NetQueryPtr query) {
++  if (hash_inflight_limit_ > 1) {
++    ActorShared<> hash_query_cancel;
++    if (hash_queries_.take(get_link_token(), file_hash_window::global_counter(), &hash_query_cancel)) {
++      hash_query_cancel.release();
++      VLOG(file_loader) << "File hash window: answer file \"" << name_ << "\" in flight " << hash_queries_.size()
++                        << " process " << file_hash_window::global_counter().value();
++    } else if (UniqueId::extract_key(get_link_token()) == COMMON_QUERY_KEY) {
++      LOG(WARNING) << "Receive result for an unknown file hash query";
++    }
++  }
+   if (stop_flag_) {
+     return;
+   }
+diff --git a/td/telegram/files/FileDownloader.h b/td/telegram/files/FileDownloader.h
+index 5197c8b..5e01357 100644
+--- a/td/telegram/files/FileDownloader.h
++++ b/td/telegram/files/FileDownloader.h
+@@ -8,6 +8,7 @@
+ 
+ #include "td/telegram/DelayDispatcher.h"
+ #include "td/telegram/files/FileEncryptionKey.h"
++#include "td/telegram/files/FileHashWindow.h"
+ #include "td/telegram/files/FileLoaderActor.h"
+ #include "td/telegram/files/FileLocation.h"
+ #include "td/telegram/files/PartsManager.h"
+@@ -94,6 +95,12 @@ class FileDownloader final : public FileLoaderActor {
+   };
+   std::set<HashInfo> hash_info_;
+   bool has_hash_query_ = false;
++  // x_file_hashes_inflight (Tucun-app/tdlib-android patches/0001-parallel-file-hashes.patch): limit > 1 only in
++  // only-check mode; with limit 1 none of the members below is used and the stock code path runs.
++  int32 hash_inflight_limit_ = 1;
++  bool hash_no_new_queries_ = false;
++  file_hash_window::InflightTable<ActorShared<>> hash_queries_;
++  std::vector<uint64> hash_new_tokens_;
+ 
+   static constexpr uint8 COMMON_QUERY_KEY = 2;
+   bool stop_flag_ = false;
+diff --git a/td/telegram/files/FileHashWindow.h b/td/telegram/files/FileHashWindow.h
+new file mode 100644
+index 0000000..68e746c
+--- /dev/null
++++ b/td/telegram/files/FileHashWindow.h
+@@ -0,0 +1,197 @@
++//
++// Parallel upload.getFileHashes for FileDownloader's only-check mode (option "x_file_hashes_inflight").
++// Added by Tucun-app/tdlib-android patches/0001-parallel-file-hashes.patch; distributed under the
++// Boost Software License, Version 1.0 (same as TDLib; see LICENSE_1_0.txt or http://www.boost.org/LICENSE_1_0.txt).
++//
++// Pure logic only: which offsets to ask next and how many queries are in flight. It does not compare anything;
++// FileDownloader::check_loop keeps the only comparison code (local sha256 vs. server hash) unchanged.
++// Depends on the standard library only, so it can be unit-tested on its own (tests/hash_window_test.cpp).
++//
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <map>
++#include <utility>
++#include <vector>
++
++namespace td {
++namespace file_hash_window {
++
++// Every upload.getFileHashes answer covers 8 x 128 KiB = 1 MiB.
++constexpr int64_t kHashStride = int64_t{1} << 20;
++constexpr int32_t kMaxInflightLimit = 32;
++
++inline int32_t clamp_limit(int64_t requested) {
++  if (requested < 1) {
++    return 1;
++  }
++  if (requested > kMaxInflightLimit) {
++    return kMaxInflightLimit;
++  }
++  return static_cast<int32_t>(requested);
++}
++
++// Number of only-check getFileHashes queries in flight in the whole process (only files with limit > 1 count).
++class Counter {
++ public:
++  // The first query of a file that has nothing in flight is never blocked (no starvation).
++  void acquire_base() {
++    value_.fetch_add(1);
++  }
++
++  // Any further query of a file needs value < limit.
++  bool try_acquire_extra(int32_t limit) {
++    int32_t current = value_.load();
++    while (current < limit) {
++      if (value_.compare_exchange_weak(current, current + 1)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  // Returns false (and keeps 0) if there was nothing to release.
++  bool release() {
++    int32_t current = value_.load();
++    while (current > 0) {
++      if (value_.compare_exchange_weak(current, current - 1)) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  int32_t value() const {
++    return value_.load();
++  }
++
++ private:
++  std::atomic<int32_t> value_{0};
++};
++
++// One instance per process (a function-local static of an inline function is shared by all translation units).
++inline Counter &global_counter() {
++  static Counter counter;
++  return counter;
++}
++
++// The in-flight queries of one file: token -> (offset, payload). Each token releases the counter at most once.
++template <class Payload>
++class InflightTable {
++ public:
++  bool empty() const {
++    return queries_.empty();
++  }
++
++  size_t size() const {
++    return queries_.size();
++  }
++
++  void add(uint64_t token, int64_t offset, Payload payload) {
++    queries_.emplace(token, std::make_pair(offset, std::move(payload)));
++  }
++
++  // Removes the query and releases one counter slot. Returns false for an unknown (or already removed) token.
++  bool take(uint64_t token, Counter &counter, Payload *payload) {
++    auto it = queries_.find(token);
++    if (it == queries_.end()) {
++      return false;
++    }
++    *payload = std::move(it->second.second);
++    queries_.erase(it);
++    counter.release();
++    return true;
++  }
++
++  // Removes every query (tear down); `on_payload` is called for each one before its slot is released.
++  template <class F>
++  void drain(Counter &counter, F &&on_payload) {
++    for (auto &query : queries_) {
++      on_payload(query.second.second);
++      counter.release();
++    }
++    queries_.clear();
++  }
++
++  std::vector<int64_t> offsets() const {
++    std::vector<int64_t> result;
++    for (auto &query : queries_) {
++      result.push_back(query.second.first);
++    }
++    return result;
++  }
++
++  std::vector<uint64_t> tokens() const {
++    std::vector<uint64_t> result;
++    for (auto &query : queries_) {
++      result.push_back(query.first);
++    }
++    return result;
++  }
++
++ private:
++  std::map<uint64_t, std::pair<int64_t, Payload>> queries_;
++};
++
++// Offsets of the next getFileHashes queries of one file, called when the checked prefix can't advance.
++//   checked_prefix   - first byte not yet verified (not covered by any known hash);
++//   covered_end      - largest end of any known hash;
++//   inflight_offsets - offsets of this file's queries in flight.
++// A counter slot is acquired for every returned offset: the first one unconditionally if the file has nothing in
++// flight, every other one only while counter < limit. Order: the gap at the checked prefix first (unless an
++// in-flight query starting in (checked_prefix - stride, checked_prefix] will cover it), then forward with a
++// fixed 1 MiB stride from the end of everything known or in flight, never at or past the end of the file.
++inline std::vector<int64_t> pick_offsets(int64_t checked_prefix, int64_t file_size, int64_t covered_end,
++                                         const std::vector<int64_t> &inflight_offsets, int32_t limit,
++                                         Counter &counter) {
++  std::vector<int64_t> result;
++  if (file_size <= 0 || checked_prefix < 0 || checked_prefix >= file_size) {
++    return result;
++  }
++  if (limit < 1) {
++    limit = 1;
++  }
++  size_t file_inflight = inflight_offsets.size();
++  auto take_slot = [&]() {
++    if (file_inflight == 0) {
++      counter.acquire_base();
++    } else if (!counter.try_acquire_extra(limit)) {
++      return false;
++    }
++    file_inflight++;
++    return true;
++  };
++
++  int64_t next = checked_prefix > covered_end ? checked_prefix : covered_end;
++  bool prefix_pending = false;
++  for (auto offset : inflight_offsets) {
++    if (offset > checked_prefix - kHashStride && offset <= checked_prefix) {
++      prefix_pending = true;
++    }
++    if (offset + kHashStride > next) {
++      next = offset + kHashStride;
++    }
++  }
++  if (!prefix_pending) {
++    if (!take_slot()) {
++      return result;
++    }
++    result.push_back(checked_prefix);
++    if (checked_prefix + kHashStride > next) {
++      next = checked_prefix + kHashStride;
++    }
++  }
++  while (next < file_size && static_cast<int32_t>(result.size()) < limit) {
++    if (!take_slot()) {
++      break;
++    }
++    result.push_back(next);
++    next += kHashStride;
++  }
++  return result;
++}
++
++}  // namespace file_hash_window
++}  // namespace td

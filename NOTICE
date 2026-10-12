@@ -1,12 +1,17 @@
 tdlib-android
 =============
 
-The binaries published by this repository are built from unmodified third-party source code.
+The binaries published by this repository are built from third-party source code. TDLib is modified only by
+the source patches in patches/ (listed in tdlib.env); all other components are unmodified.
 
 TDLib (Telegram Database library)
   https://github.com/tdlib/td
   Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
   Distributed under the Boost Software License, Version 1.0 (see LICENSE).
+  Modifications: patches/0001-parallel-file-hashes.patch (parallel upload.getFileHashes in TDLib's only-check
+  download mode, option x_file_hashes_inflight) changes td/telegram/files/FileDownloader.h and
+  td/telegram/files/FileDownloader.cpp and adds td/telegram/files/FileHashWindow.h. The modifications are
+  released under the Boost Software License, Version 1.0.
 
 OpenSSL 1.1.1w (statically linked into libtdjni.so by the official TDLib build)
   https://github.com/openssl/openssl/tree/OpenSSL_1_1_1w
