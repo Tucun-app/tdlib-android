@@ -212,6 +212,8 @@ def tree_digest(root):
     for dp, dn, fn in os.walk(root):
         dn[:] = [d for d in dn if d != ".git"]
         for f in fn:
+            if f == ".git":  # a worktree's .git is a file naming its own gitdir; not tree content
+                continue
             p = os.path.join(dp, f)
             rel = os.path.relpath(p, root).replace(os.sep, "/")
             with open(p, "rb") as fh:
