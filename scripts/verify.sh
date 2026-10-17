@@ -23,6 +23,14 @@ for f in java/org/drinkless/tdlib/Client.java java/org/drinkless/tdlib/TdApi.jav
   if [ -s "$dir/$f" ]; then echo "OK   present $f"; else echo "FAIL missing $f"; fail=1; fi
 done
 
+if [ -n "${TDLIB_REQUIRE_API_CLASS:-}" ]; then
+  if grep -q "class ${TDLIB_REQUIRE_API_CLASS} " "$dir/java/org/drinkless/tdlib/TdApi.java"; then
+    echo "OK   TdApi.java declares ${TDLIB_REQUIRE_API_CLASS}"
+  else
+    echo "FAIL TdApi.java does not declare ${TDLIB_REQUIRE_API_CLASS} (td_api.tl change not regenerated?)"; fail=1
+  fi
+fi
+
 for abi in arm64-v8a armeabi-v7a x86_64 x86; do
   so="$dir/libs/$abi/libtdjni.so"
   if [ ! -s "$so" ]; then

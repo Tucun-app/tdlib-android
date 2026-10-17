@@ -29,8 +29,18 @@ jobs:
           git -C stock fetch -q --depth 1 origin "$TDLIB_COMMIT"
           git -C stock checkout -q FETCH_HEAD
           test "$(git -C stock rev-parse HEAD)" = "$TDLIB_COMMIT"
+          # base = stock + every patch before the last one (what the last patch's guard compares against);
+          # patched = stock + all patches (what the build produces).
+          git -C stock worktree add -q --detach ../base "$TDLIB_COMMIT"
           git -C stock worktree add -q --detach ../patched "$TDLIB_COMMIT"
-          for p in $TDLIB_PATCHES; do git -C patched apply --index "$PWD/$p"; done
+          set -- $TDLIB_PATCHES
+          n=$#
+          i=0
+          for p in "$@"; do
+            i=$((i + 1))
+            if [ "$i" -lt "$n" ]; then git -C base apply --index "$PWD/$p"; fi
+            git -C patched apply --index "$PWD/$p"
+          done
           GIT_AUTHOR_NAME="$TDLIB_PATCH_NAME" GIT_AUTHOR_EMAIL="$TDLIB_PATCH_EMAIL" GIT_AUTHOR_DATE="$TDLIB_PATCH_DATE" \
             GIT_COMMITTER_NAME="$TDLIB_PATCH_NAME" GIT_COMMITTER_EMAIL="$TDLIB_PATCH_EMAIL" GIT_COMMITTER_DATE="$TDLIB_PATCH_DATE" \
             git -C patched -c commit.gpgsign=false commit -q -m "$TDLIB_PATCH_MESSAGE"
@@ -42,10 +52,14 @@ jobs:
         run: |
           set -o pipefail
           source tdlib.env
-          for p in $TDLIB_PATCHES; do
-            scripts/check-patch-scope.sh stock patched "$p" | tee -a patch-check.txt
-            scripts/check-patch-scope.sh --self-test stock patched "$p" | tee -a patch-check.txt
-          done
+          # Each patch is checked by its own guard against the tree it was written for (not by relaxing the guard of an
+          # earlier patch): 0001 against stock + 0001, 0002 against (stock + 0001) -> (stock + 0001 + 0002).
+          git -C stock worktree add -q --detach ../p1tree "$TDLIB_COMMIT"
+          git -C p1tree apply --index "$PWD/patches/0001-parallel-file-hashes.patch"
+          scripts/check-patch-scope.sh stock p1tree patches/0001-parallel-file-hashes.patch | tee -a patch-check.txt
+          scripts/check-patch-scope.sh --self-test stock p1tree patches/0001-parallel-file-hashes.patch | tee -a patch-check.txt
+          scripts/check-patch-scope-p2.sh p1tree patched patches/0002-remote-file-hashes.patch | tee -a patch-check.txt
+          scripts/check-patch-scope-p2.sh --self-test p1tree patched patches/0002-remote-file-hashes.patch | tee -a patch-check.txt
 
       - name: Unit tests of FileHashWindow.h (TDLib language flags + ASan/UBSan)
         run: |

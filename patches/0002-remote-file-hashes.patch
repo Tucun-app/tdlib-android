@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: tdlib-android <tdlib-android@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Add getRemoteFileHashes: read-only access to
+ upload.getFileHashes
+
+Modification of TDLib (https://github.com/tdlib/td) by Tucun-app/tdlib-android,
+released under the Boost Software License, Version 1.0 (same as TDLib; see
+LICENSE_1_0.txt). Files changed: td/generate/scheme/td_api.tl,
+td/telegram/Requests.h, td/telegram/Requests.cpp (additions only).
+
+New td_api function getRemoteFileHashes(file_id, offset) returns the SHA-256
+hashes of the parts of a remote file exactly as the server reports them
+(upload.getFileHashes). It has no path parameter, does not download the file,
+does not read or write any local file and does not change the state of the
+file. It sends a single kind of request and hands the server answer (or the
+error) to the caller.
+---
+ td/generate/scheme/td_api.tl | 14 ++++++++++
+ td/telegram/Requests.cpp     | 53 ++++++++++++++++++++++++++++++++++++
+ td/telegram/Requests.h       |  2 ++
+ 3 files changed, 69 insertions(+)
+
+diff --git a/td/generate/scheme/td_api.tl b/td/generate/scheme/td_api.tl
+index c98b3aa..d702480 100644
+--- a/td/generate/scheme/td_api.tl
++++ b/td/generate/scheme/td_api.tl
+@@ -8623,6 +8623,15 @@ seconds seconds:double = Seconds;
+ //@description Contains size of downloaded prefix of a file @size The prefix size, in bytes
+ fileDownloadedPrefixSize size:int53 = FileDownloadedPrefixSize;
+ 
++//@description Contains the SHA-256 hash of a part of a remote file, as stored on the server
++//@offset Offset of the part in the file, in bytes
++//@size Size of the part as reported by the server, in bytes; may be larger than the number of bytes of the last part of a file
++//@sha256 SHA-256 hash of the bytes of the part, as stored on the server; 32 bytes
++fileHashPart offset:int53 size:int32 sha256:bytes = FileHashPart;
++
++//@description Contains the hashes of parts of a remote file @parts The hashes, in the order returned by the server
++fileHashParts parts:vector<fileHashPart> = FileHashParts;
++
+ //@description Contains a number of Telegram Stars @star_count Number of Telegram Stars
+ starCount star_count:int53 = StarCount;
+ 
+@@ -12031,6 +12040,11 @@ downloadFile file_id:int32 priority:int32 offset:int53 limit:int53 synchronous:B
+ //@description Returns file downloaded prefix size from a given offset, in bytes @file_id Identifier of the file @offset Offset from which downloaded prefix size needs to be calculated
+ getFileDownloadedPrefixSize file_id:int32 offset:int53 = FileDownloadedPrefixSize;
+ 
++//@description Asks the server for the SHA-256 hashes of the parts of a remote file, starting from a given offset. The file isn't downloaded, no local file is read or written and the state of the file doesn't change. The server rounds the offset down to a multiple of 1048576 and returns at most 8 consecutive parts of 131072 bytes. Returns an error if the file has no remote location, is encrypted, or has an unknown size
++//@file_id Identifier of the file
++//@offset Offset in the file from which the hashes are requested; must be in [0, file size)
++getRemoteFileHashes file_id:int32 offset:int53 = FileHashParts;
++
+ //@description Stops the downloading of a file. If a file has already been downloaded, does nothing @file_id Identifier of a file to stop downloading @only_if_pending Pass true to stop downloading only if it hasn't been started, i.e. request hasn't been sent to server
+ cancelDownloadFile file_id:int32 only_if_pending:Bool = Ok;
+ 
+diff --git a/td/telegram/Requests.cpp b/td/telegram/Requests.cpp
+index c866f06..c823120 100644
+--- a/td/telegram/Requests.cpp
++++ b/td/telegram/Requests.cpp
+@@ -5925,6 +5925,59 @@ void Requests::on_request(uint64 id, const td_api::getFileDownloadedPrefixSize &
+   send_closure(td_actor_, &Td::send_result, id,
+                td_api::make_object<td_api::fileDownloadedPrefixSize>(file_view.downloaded_prefix(request.offset_)));
+ }
++// getRemoteFileHashes: begin
++class GetRemoteFileHashesQuery final : public Td::ResultHandler {
++  Promise<td_api::object_ptr<td_api::fileHashParts>> promise_;
++
++ public:
++  explicit GetRemoteFileHashesQuery(Promise<td_api::object_ptr<td_api::fileHashParts>> &&promise)
++      : promise_(std::move(promise)) {
++  }
++
++  void send(const FileView &file_view, int64 offset, bool is_small) {
++    auto *location = file_view.get_full_remote_location();
++    auto query = telegram_api::upload_getFileHashes(location->as_input_file_location(), offset);
++    auto net_query_type = is_small ? NetQuery::Type::DownloadSmall : NetQuery::Type::Download;
++    send_query(G()->net_query_creator().create(query, {}, location->get_dc_id(), net_query_type));
++  }
++
++  void on_result(BufferSlice packet) final {
++    auto result_ptr = fetch_result<telegram_api::upload_getFileHashes>(packet);
++    if (result_ptr.is_error()) {
++      return on_error(result_ptr.move_as_error());
++    }
++    auto hashes = result_ptr.move_as_ok();
++    auto parts = transform(hashes, [](const tl_object_ptr<telegram_api::fileHash> &hash) {
++      return td_api::make_object<td_api::fileHashPart>(hash->offset_, hash->limit_, hash->hash_.as_slice().str());
++    });
++    promise_.set_value(td_api::make_object<td_api::fileHashParts>(std::move(parts)));
++  }
++
++  void on_error(Status status) final {
++    promise_.set_error(std::move(status));
++  }
++};
++
++void Requests::on_request(uint64 id, const td_api::getRemoteFileHashes &request) {
++  CREATE_REQUEST_PROMISE();
++  auto file_view = td_->file_manager_->get_file_view(FileId(request.file_id_, 0));
++  if (file_view.empty()) {
++    return promise.set_error(Status::Error(400, "Unknown file ID"));
++  }
++  if (!file_view.has_full_remote_location() || file_view.is_encrypted_any() || file_view.size() <= 0) {
++    return promise.set_error(Status::Error(400, "FILE_HASH_UNSUPPORTED"));
++  }
++  auto *location = file_view.get_full_remote_location();
++  if (location->is_web() || !location->is_document()) {
++    return promise.set_error(Status::Error(400, "FILE_HASH_UNSUPPORTED"));
++  }
++  if (request.offset_ < 0 || request.offset_ >= file_view.size()) {
++    return promise.set_error(Status::Error(400, "FILE_HASH_OFFSET_INVALID"));
++  }
++  td_->create_handler<GetRemoteFileHashesQuery>(std::move(promise))
++      ->send(file_view, request.offset_, file_view.size() < 20 * 1024);
++}
++// getRemoteFileHashes: end
+ 
+ void Requests::on_request(uint64 id, const td_api::cancelDownloadFile &request) {
+   td_->file_manager_->cancel_download(FileId(request.file_id_, 0), 0, request.only_if_pending_);
+diff --git a/td/telegram/Requests.h b/td/telegram/Requests.h
+index d1747de..324bcc3 100644
+--- a/td/telegram/Requests.h
++++ b/td/telegram/Requests.h
+@@ -1111,6 +1111,8 @@ class Requests {
+ 
+   void on_request(uint64 id, const td_api::getFileDownloadedPrefixSize &request);
+ 
++  void on_request(uint64 id, const td_api::getRemoteFileHashes &request);
++
+   void on_request(uint64 id, const td_api::cancelDownloadFile &request);
+ 
+   void on_request(uint64 id, const td_api::getSuggestedFileName &request);
